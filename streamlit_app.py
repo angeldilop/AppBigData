@@ -1,11 +1,12 @@
 import os
-import json
+import tempfile
 
 import streamlit as st
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from neo4j import GraphDatabase
 import neo4j  # para TrustAll (Neo4j Aura)
+from pyvis.network import Network
 import streamlit.components.v1 as components
 
 
@@ -56,7 +57,12 @@ def get_neo4j_driver():
 
 def mostrar_detalle_providencia(prov_id: str):
     """Muestra el detalle de una providencia (consulta Mongo)."""
-    _, _, col_prov, _ = get_mongo()
+    try:
+        _, _, col_prov, _ = get_mongo()
+    except Exception as e:
+        st.error(f"Error de conexión a MongoDB: {e}")
+        return
+
     doc = col_prov.find_one({"providencia": prov_id}, {"_id": 0})
 
     if not doc:
@@ -81,8 +87,13 @@ def mostrar_detalle_providencia(prov_id: str):
 
 def buscar_por_texto(q: str):
     """Búsqueda por texto usando índice de texto de Mongo."""
-    _, _, col_prov, _ = get_mongo()
+    try:
+        _, _, col_prov, _ = get_mongo()
+    except Exception as e:
+        st.error(f"Error de conexión a MongoDB: {e}")
+        return
 
+    # Se asume que el índice de texto ya fue creado en la ETL
     cursor = col_prov.find(
         {"$text": {"$search": q}},
         {"_id": 0, "texto": 1, "providencia": 1, "anio": 1, "tipo": 1},
@@ -109,8 +120,14 @@ def buscar_por_texto(q: str):
 
 
 def ver_similitudes(prov_id: str, min_sim: float):
-    """Consulta la colección 'similitudes' en Mongo y muestra lista deduplicada."""
-    _, _, _, col_sim = get_mongo()
+    """
+    Consulta la colección 'similitudes' en Mongo.
+    """
+    try:
+        _, _, _, col_sim = get_mongo()
+    except Exception as e:
+        st.error(f"Error de conexión a MongoDB: {e}")
+        return
 
     sims = list(col_sim.find(
         {
@@ -126,31 +143,18 @@ def ver_similitudes(prov_id: str, min_sim: float):
         st.info("No hay registros de similitud para esa providencia en la colección `similitudes`.")
         return
 
-    # Rango real de similitudes disponibles para esa providencia
-    all_scores = [
-        float(s.get("similitud", 0.0))
-        for s in sims
-        if s.get("similitud") is not None
-    ]
-    if all_scores:
-        st.caption(
-            f"Las similitudes disponibles para {prov_id} están entre "
-            f"{min(all_scores):.2f} y {max(all_scores):.2f}. "
-            f"(Umbral actual en el control: {min_sim:.2f})"
-        )
+    # Construimos un diccionario {otro: max(similitud)}
+    scores_por_otro = {}
 
-    # 1) Filtrar por umbral y decidir "otro"
-    candidatos = []
     for s in sims:
         p1 = s.get("providencia1")
         p2 = s.get("providencia2")
-        score = s.get("similitud", 0.0)
+        score = s.get("similitud")
+
         if score is None:
             continue
 
         score = float(score)
-        if score < min_sim:
-            continue
 
         if p1 == prov_id:
             otro = p2
@@ -160,27 +164,39 @@ def ver_similitudes(prov_id: str, min_sim: float):
         if not otro:
             continue
 
-        candidatos.append((otro, score))
+        # Nos quedamos con la similitud más alta para ese "otro"
+        if otro in scores_por_otro:
+            scores_por_otro[otro] = max(scores_por_otro[otro], score)
+        else:
+            scores_por_otro[otro] = score
 
-    if not candidatos:
+    if not scores_por_otro:
+        st.info("No se pudieron calcular similitudes válidas para esta providencia.")
+        return
+
+    # Rango real de similitudes
+    all_scores = list(scores_por_otro.values())
+    st.caption(
+        f"Las similitudes disponibles para {prov_id} están entre "
+        f"{min(all_scores):.2f} y {max(all_scores):.2f}. "
+        f"(Umbral actual en el control: {min_sim:.2f})"
+    )
+
+    # Aplicamos el umbral al diccionario ya fusionado
+    sims_filtradas = [
+        {"otro": otro, "similitud": sim}
+        for otro, sim in scores_por_otro.items()
+        if sim >= min_sim
+    ]
+
+    sims_filtradas.sort(key=lambda x: x["similitud"], reverse=True)
+
+    if not sims_filtradas:
         st.info(
             f"No se encontraron providencias similares con umbral ≥ {min_sim:.2f}. "
             "Prueba con un valor más bajo dentro del rango mostrado."
         )
         return
-
-    # 2) Deduplicar por providencia destino (tomando la mayor similitud)
-    mejor_por_otro = {}
-    for otro, score in candidatos:
-        if (otro not in mejor_por_otro) or (score > mejor_por_otro[otro]):
-            mejor_por_otro[otro] = score
-
-    # 3) Convertir a lista ordenada
-    sims_filtradas = [
-        {"otro": otro, "similitud": score}
-        for otro, score in mejor_por_otro.items()
-    ]
-    sims_filtradas.sort(key=lambda x: x["similitud"], reverse=True)
 
     st.write(f"Se encontraron **{len(sims_filtradas)}** providencias similares (≥ {min_sim:.2f}):")
 
@@ -191,128 +207,154 @@ def ver_similitudes(prov_id: str, min_sim: float):
         with cols[0]:
             st.markdown(f"- **{otro}** (similitud: **{sim:.4f}**)")
         with cols[1]:
-            # key único usando índice
+            # idx se usa para evitar claves duplicadas
             if st.button(f"Ver {otro}", key=f"sim_{prov_id}_{otro}_{idx}"):
                 mostrar_detalle_providencia(otro)
 
 
 def show_graph_for_providencia(prov_id: str, min_sim: float):
-    """Consulta Neo4j y dibuja el grafo usando vis-network (sin PyVis)."""
-    driver, database = get_neo4j_driver()
+    """
+    Consulta Neo4j y dibuja el grafo con Pyvis.
+    El label del nodo se enriquece con datos de MongoDB y los ajustes de visualización.
+    """
+    try:
+        driver, database = get_neo4j_driver()
+        _, _, col_prov, _ = get_mongo()  # Necesitamos Mongo para obtener TIPO y AÑO
+    except Exception as e:
+        st.error(f"Error de conexión: No se pudo conectar a Neo4j o a MongoDB. Causa: {e}")
+        return
+
+    # 1. Función para obtener metadatos de MongoDB (para etiquetas enriquecidas)
+    @st.cache_data
+    def get_prov_metadata(p_id):
+        doc = col_prov.find_one({"providencia": p_id}, {"_id": 0, "tipo": 1, "anio": 1})
+        if doc:
+            return doc.get("tipo", "Tipo?"), doc.get("anio", "Año?")
+        return "Tipo?", "Año?"
+
+    # Obtener detalles del nodo raíz desde Mongo para la etiqueta
+    root_tipo, root_anio = get_prov_metadata(prov_id)
+    # Etiqueta enriquecida: ID y metadatos en dos líneas (usando \n)
+    root_label = f"{prov_id}\n({root_tipo}-{root_anio})"
+    root_title = f"ID: {prov_id}, Tipo: {root_tipo}, Año: {root_anio}"
+
 
     with driver.session(database=database) as session:
         query = """
         MATCH (p:Providencia {id: $id})-[r:SIMILAR_A]->(q:Providencia)
         WHERE r.similitud >= $min_sim
-        RETURN p.id AS origen, q.id AS destino, r.similitud AS similitud
+        RETURN p.id AS origen, q.id AS destino, r.similitud AS similitud, q.tipo AS tipo_q, q.anio AS anio_q
         ORDER BY similitud DESC
         """
+        # Se añaden las propiedades del nodo vecino (q.tipo, q.anio) al RETURN de Cypher
         rows = session.run(query, id=prov_id, min_sim=min_sim).data()
 
     if not rows:
         st.info("No se encontraron vecinos en el grafo con esa similitud mínima.")
         return
 
-    # Construimos nodos y aristas para vis-network
-    nodes_dict = {}
+    # Grafo base
+    net = Network(height="750px", width="100%", directed=True)
+    net.barnes_hut()
 
-    # Nodo raíz destacado
-    nodes_dict[prov_id] = {
-        "id": prov_id,
-        "label": prov_id,
-        "color": "#7887F5",
+    # Opciones de física para un mejor layout y asegurar formato JSON correcto
+    net.set_options("""
+    {
+      "physics": {
+        "barnesHut": {
+          "springLength": 130
+        }
+      },
+      "edges": {
+        "smooth": {
+          "type": "continuous"
+        }
+      },
+      "nodes": {
+        "shape": "circle",
+        "font": {
+          "multi": "html",
+          "align": "center"
+        }
+      }
     }
+    """)
 
-    edges = []
+    # Nodo raíz (providencia seleccionada): AZUL
+    net.add_node(
+        prov_id,
+        label=root_label,
+        title=root_title,
+        color="#7887F5",
+        font={"color": "#0C0909", "size": 14, "face": "arial", "align": "center"}, # Ajuste de tamaño de fuente
+        size=30,  # Aumento del tamaño del nodo para acomodar más texto
+        shape="circle" 
+    )
+
+    added_nodes = {prov_id}
 
     for row in rows:
         origen = row["origen"]
         destino = row["destino"]
         sim = float(row["similitud"])
 
-        # Nodo origen
-        if origen not in nodes_dict:
-            nodes_dict[origen] = {
-                "id": origen,
-                "label": origen,
-                "color": "#0C0909" if origen != prov_id else "#7887F5",
-            }
+        # Datos del nodo vecino
+        tipo_q = row.get("tipo_q", "Tipo?")
+        anio_q = row.get("anio_q", "Año?")
+        neighbor_label = f"{destino}\n({tipo_q}-{anio_q})"
+        neighbor_title = f"ID: {destino}, Tipo: {tipo_q}, Año: {anio_q}"
 
-        # Nodo destino
-        if destino not in nodes_dict:
-            nodes_dict[destino] = {
-                "id": destino,
-                "label": destino,
-                "color": "#0C0909" if destino != prov_id else "#7887F5",
-            }
 
-        edges.append(
-            {
-                "from": origen,
-                "to": destino,
-                "label": f"{sim:.2f}",
-                "title": f"Similitud: {sim:.4f}",
-            }
+        # Aseguramos que los nodos vecinos se añadan con la etiqueta enriquecida
+        if destino not in added_nodes:
+            net.add_node(
+                destino,
+                label=neighbor_label,
+                title=neighbor_title,
+                color="#55F57D",  # Verde para vecinos
+                font={"color": "#0C0909", "size": 10, "face": "arial", "align": "center"}, # Ajuste de tamaño de fuente
+                size=20, # Aumento del tamaño del nodo vecino
+                shape="circle" 
+            )
+            added_nodes.add(destino)
+
+        # Aristas con etiqueta de similitud
+        net.add_edge(
+            origen,
+            destino,
+            title=f"Similitud: {sim:.4f}",
+            label=f"{sim:.2f}",
+            width=3, 
+            color="#7887F5",
+            arrows="to",
+            length=250
         )
 
-    nodes = list(nodes_dict.values())
+    # Renderizamos el HTML y lo incrustamos en Streamlit
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as tmp:
+        net.write_html(tmp.name, notebook=False)
+        html = open(tmp.name, "r", encoding="utf-8").read()
 
-    nodes_json = json.dumps(nodes)
-    edges_json = json.dumps(edges)
-
-    html = f"""
-    <html>
-    <head>
-      <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
-    </head>
-    <body>
-      <div id="mynetwork" style="width: 100%; height: 600px; border: 1px solid #0C0909;"></div>
-      <script type="text/javascript">
-        var nodes = new vis.DataSet({nodes_json});
-        var edges = new vis.DataSet({edges_json});
-
-        var container = document.getElementById('mynetwork');
-        var data = {{
-          nodes: nodes,
-          edges: edges
-        }};
-        var options = {{
-          nodes: {{
-            shape: 'dot',
-            size: 16,
-            font: {{ size: 16, color: '#0C0909' }},
-          }},
-          edges: {{
-            arrows: 'to',
-            font: {{ size: 12, align: 'top', color: '#0C0909' }},
-            color: {{ color: '#0C0909', opacity: 0.7 }},
-            smooth: true
-          }},
-          physics: {{
-            stabilization: true
-          }}
-        }};
-        var network = new vis.Network(container, data, options);
-      </script>
-    </body>
-    </html>
-    """
-
-    components.html(html, height=650, scrolling=True)
+    components.html(html, height=750, scrolling=True)
 
 
 def explorador_providencias():
     """Explorador maestro-detalle con filtros por código, tipo y año."""
     st.subheader("Explorador de providencias")
 
-    client, db, col_prov, _ = get_mongo()
+    try:
+        client, db, col_prov, _ = get_mongo()
+    except Exception as e:
+        st.error(f"Error de conexión a MongoDB: {e}")
+        return
+
     docs = list(col_prov.find({}, {"_id": 0}))
 
     if not docs:
         st.info("No hay providencias cargadas en la base de datos.")
         return
 
-    # Obtener tipos y años disponibles
+    # Tipos y años disponibles
     tipos = sorted({d.get("tipo", "").strip() for d in docs if d.get("tipo")})
     anios_raw = []
     for d in docs:
@@ -329,7 +371,6 @@ def explorador_providencias():
         min_year = 2000
         max_year = 2030
 
-    # Filtros
     st.markdown("Filtra las providencias por código, tipo y rango de años:")
 
     col_f1, col_f2, col_f3 = st.columns([2, 2, 3])
@@ -365,9 +406,8 @@ def explorador_providencias():
             anio = d.get("anio")
 
             # Filtro por código
-            if codigo.strip():
-                if prov.strip() != codigo.strip():
-                    continue
+            if codigo.strip() and prov.strip() != codigo.strip():
+                continue
 
             # Filtro por tipo
             if tipo_sel != "Todos" and tipo != tipo_sel:
@@ -389,7 +429,7 @@ def explorador_providencias():
 
         st.session_state["expl_resultados"] = filtrados
 
-        # Seleccionar automáticamente una providencia
+        # Selección inicial
         if codigo.strip():
             st.session_state["selected_prov"] = codigo.strip()
         elif filtrados:
@@ -438,7 +478,7 @@ def main():
     if "menu" not in st.session_state:
         st.session_state["menu"] = "Inicio"
 
-    # ==== ESTILOS GLOBALES (SOLO 3 COLORES) ====
+    # ==== ESTILOS GLOBALES (COLORES CORPORATIVOS) ====
     st.markdown(
         """
         <style>
@@ -448,27 +488,29 @@ def main():
             color: #0C0909;
         }
 
-        /* Títulos y textos principales */
-        h1, h2, h3, h4 {
+        /* Títulos y texto principal */
+        h1, h2, h3, h4, h5, h6 {
+            color: #0C0909;
+        }
+        body, p {
             color: #0C0909;
         }
 
-        /* Botones en contenido principal */
+        /* Botones en contenido principal: AZUL + blanco, sin cambios en hover */
         div.stButton > button {
             background-color: #7887F5;
             color: #FFFFFF;
             border-radius: 8px;
-            border: 1px solid #0C0909;
+            border: none;
             padding: 0.4rem 0.8rem;
         }
-
         div.stButton > button:hover {
-            background-color: #0C0909;
+            background-color: #7887F5;
             color: #FFFFFF;
-            border-color: #0C0909;
+            border: none;
         }
 
-        /* Botones del sidebar: estilo “link” clickeable */
+        /* Botones del sidebar estilo texto, sin cambio de color en hover */
         [data-testid="stSidebar"] .stButton > button {
             background: transparent;
             color: #0C0909;
@@ -477,34 +519,39 @@ def main():
             padding: 0.3rem 0.2rem;
             font-size: 0.95rem;
         }
-
         [data-testid="stSidebar"] .stButton > button:hover {
             background: transparent;
             color: #0C0909;
-            text-decoration: underline;
+            border: none;
         }
 
-        /* Slider: colores de la paleta, sin rojos ni azules */
+        /* Slider con color de la paleta */
         .stSlider [data-baseweb="slider"] > div > div {
             background-color: #7887F5 !important;
         }
         .stSlider [data-baseweb="slider"] [role="slider"] {
             background-color: #7887F5 !important;
-            border-color: #0C0909 !important;
+            border: none !important;
         }
-        /* Etiquetas de valores del slider sin azul */
-        .stSlider span[data-baseweb="tag"] {
-            background-color: #A09984 !important;
+        .stSlider [data-testid="stTickBarMin"],
+        .stSlider [data-testid="stTickBarMax"],
+        .stSlider [data-testid="stSliderValue"] {
+            background: transparent !important;
             color: #0C0909 !important;
+            border: none !important;
+        }
+
+        /* Quitar resaltado azul en inputs activos */
+        input, textarea, select {
+            box-shadow: none !important;
         }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
-    # ==== MENÚ LATERAL ====
+    # ==== MENÚ LATERAL (solo textos clicables) ====
     with st.sidebar:
-        # Sin título "Módulos de consulta", solo opciones clickeables
         if st.button("Inicio"):
             st.session_state["menu"] = "Inicio"
 
@@ -523,7 +570,6 @@ def main():
     menu = st.session_state["menu"]
 
     # ==== CONTENIDO PRINCIPAL ====
-
     st.title("JurisAudio Insight – Explorador interactivo de providencias")
 
     st.markdown(
