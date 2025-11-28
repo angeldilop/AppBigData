@@ -207,7 +207,6 @@ def ver_similitudes(prov_id: str, min_sim: float):
         with cols[0]:
             st.markdown(f"- **{otro}** (similitud: **{sim:.4f}**)")
         with cols[1]:
-            # idx se usa para evitar claves duplicadas
             if st.button(f"Ver {otro}", key=f"sim_{prov_id}_{otro}_{idx}"):
                 mostrar_detalle_providencia(otro)
 
@@ -224,7 +223,6 @@ def show_graph_for_providencia(prov_id: str, min_sim: float):
         st.error(f"Error de conexión: No se pudo conectar a Neo4j o a MongoDB. Causa: {e}")
         return
 
-    # 1. Función para obtener metadatos de MongoDB (para etiquetas enriquecidas)
     @st.cache_data
     def get_prov_metadata(p_id):
         doc = col_prov.find_one({"providencia": p_id}, {"_id": 0, "tipo": 1, "anio": 1})
@@ -232,12 +230,9 @@ def show_graph_for_providencia(prov_id: str, min_sim: float):
             return doc.get("tipo", "Tipo?"), doc.get("anio", "Año?")
         return "Tipo?", "Año?"
 
-    # Obtener detalles del nodo raíz desde Mongo para la etiqueta
     root_tipo, root_anio = get_prov_metadata(prov_id)
-    # Etiqueta enriquecida: ID y metadatos en dos líneas (usando \n)
     root_label = f"{prov_id}\n({root_tipo}-{root_anio})"
     root_title = f"ID: {prov_id}, Tipo: {root_tipo}, Año: {root_anio}"
-
 
     with driver.session(database=database) as session:
         query = """
@@ -246,18 +241,15 @@ def show_graph_for_providencia(prov_id: str, min_sim: float):
         RETURN p.id AS origen, q.id AS destino, r.similitud AS similitud, q.tipo AS tipo_q, q.anio AS anio_q
         ORDER BY similitud DESC
         """
-        # Se añaden las propiedades del nodo vecino (q.tipo, q.anio) al RETURN de Cypher
         rows = session.run(query, id=prov_id, min_sim=min_sim).data()
 
     if not rows:
         st.info("No se encontraron vecinos en el grafo con esa similitud mínima.")
         return
 
-    # Grafo base
     net = Network(height="750px", width="100%", directed=True)
     net.barnes_hut()
 
-    # Opciones de física para un mejor layout y asegurar formato JSON correcto
     net.set_options("""
     {
       "physics": {
@@ -280,15 +272,14 @@ def show_graph_for_providencia(prov_id: str, min_sim: float):
     }
     """)
 
-    # Nodo raíz (providencia seleccionada): AZUL
     net.add_node(
         prov_id,
         label=root_label,
         title=root_title,
         color="#7887F5",
-        font={"color": "#0C0909", "size": 14, "face": "arial", "align": "center"}, # Ajuste de tamaño de fuente
-        size=30,  # Aumento del tamaño del nodo para acomodar más texto
-        shape="circle" 
+        font={"color": "#0C0909", "size": 14, "face": "arial", "align": "center"},
+        size=30,
+        shape="circle"
     )
 
     added_nodes = {prov_id}
@@ -298,39 +289,34 @@ def show_graph_for_providencia(prov_id: str, min_sim: float):
         destino = row["destino"]
         sim = float(row["similitud"])
 
-        # Datos del nodo vecino
         tipo_q = row.get("tipo_q", "Tipo?")
         anio_q = row.get("anio_q", "Año?")
         neighbor_label = f"{destino}\n({tipo_q}-{anio_q})"
         neighbor_title = f"ID: {destino}, Tipo: {tipo_q}, Año: {anio_q}"
 
-
-        # Aseguramos que los nodos vecinos se añadan con la etiqueta enriquecida
         if destino not in added_nodes:
             net.add_node(
                 destino,
                 label=neighbor_label,
                 title=neighbor_title,
-                color="#55F57D",  # Verde para vecinos
-                font={"color": "#0C0909", "size": 10, "face": "arial", "align": "center"}, # Ajuste de tamaño de fuente
-                size=20, # Aumento del tamaño del nodo vecino
-                shape="circle" 
+                color="#55F57D",
+                font={"color": "#0C0909", "size": 10, "face": "arial", "align": "center"},
+                size=20,
+                shape="circle"
             )
             added_nodes.add(destino)
 
-        # Aristas con etiqueta de similitud
         net.add_edge(
             origen,
             destino,
             title=f"Similitud: {sim:.4f}",
             label=f"{sim:.2f}",
-            width=3, 
+            width=3,
             color="#7887F5",
             arrows="to",
             length=250
         )
 
-    # Renderizamos el HTML y lo incrustamos en Streamlit
     with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as tmp:
         net.write_html(tmp.name, notebook=False)
         html = open(tmp.name, "r", encoding="utf-8").read()
@@ -354,7 +340,6 @@ def explorador_providencias():
         st.info("No hay providencias cargadas en la base de datos.")
         return
 
-    # Tipos y años disponibles
     tipos = sorted({d.get("tipo", "").strip() for d in docs if d.get("tipo")})
     anios_raw = []
     for d in docs:
@@ -396,7 +381,6 @@ def explorador_providencias():
     if "selected_prov" not in st.session_state:
         st.session_state["selected_prov"] = None
 
-    # Aplicar filtros
     if st.button("Buscar en explorador"):
         filtrados = []
 
@@ -405,15 +389,12 @@ def explorador_providencias():
             tipo = d.get("tipo", "")
             anio = d.get("anio")
 
-            # Filtro por código
             if codigo.strip() and prov.strip() != codigo.strip():
                 continue
 
-            # Filtro por tipo
             if tipo_sel != "Todos" and tipo != tipo_sel:
                 continue
 
-            # Filtro por año
             ok_year = True
             try:
                 anio_int = int(anio)
@@ -429,7 +410,6 @@ def explorador_providencias():
 
         st.session_state["expl_resultados"] = filtrados
 
-        # Selección inicial
         if codigo.strip():
             st.session_state["selected_prov"] = codigo.strip()
         elif filtrados:
@@ -474,21 +454,17 @@ def main():
         layout="wide"
     )
 
-    # Estado inicial del menú
     if "menu" not in st.session_state:
         st.session_state["menu"] = "Inicio"
 
-    # ==== ESTILOS GLOBALES (COLORES CORPORATIVOS) ====
     st.markdown(
         """
         <style>
-        /* Sidebar gris claro */
         [data-testid="stSidebar"] {
             background-color: #A09984;
             color: #0C0909;
         }
 
-        /* Títulos y texto principal */
         h1, h2, h3, h4, h5, h6 {
             color: #0C0909;
         }
@@ -496,7 +472,6 @@ def main():
             color: #0C0909;
         }
 
-        /* Botones en contenido principal: AZUL + blanco, sin cambios en hover */
         div.stButton > button {
             background-color: #7887F5;
             color: #FFFFFF;
@@ -510,7 +485,6 @@ def main():
             border: none;
         }
 
-        /* Botones del sidebar estilo texto, sin cambio de color en hover */
         [data-testid="stSidebar"] .stButton > button {
             background: transparent;
             color: #0C0909;
@@ -525,7 +499,6 @@ def main():
             border: none;
         }
 
-        /* Slider con color de la paleta */
         .stSlider [data-baseweb="slider"] > div > div {
             background-color: #7887F5 !important;
         }
@@ -541,7 +514,6 @@ def main():
             border: none !important;
         }
 
-        /* Quitar resaltado azul en inputs activos */
         input, textarea, select {
             box-shadow: none !important;
         }
@@ -550,7 +522,6 @@ def main():
         unsafe_allow_html=True,
     )
 
-    # ==== MENÚ LATERAL (solo textos clicables) ====
     with st.sidebar:
         if st.button("Inicio"):
             st.session_state["menu"] = "Inicio"
@@ -569,7 +540,6 @@ def main():
 
     menu = st.session_state["menu"]
 
-    # ==== CONTENIDO PRINCIPAL ====
     st.title("JurisAudio Insight – Explorador interactivo de providencias")
 
     st.markdown(
